@@ -10,6 +10,7 @@ import android.webkit.WebResourceRequest
 import android.graphics.Bitmap
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
@@ -19,6 +20,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
+import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -51,7 +53,10 @@ import ua.kropilive.app.data.repository.TelegramQueueGraph
 import ua.kropilive.app.data.repository.TelegramGraphCheck
 import java.time.LocalDate
 import java.time.LocalTime
+import ua.kropilive.app.ui.schedules.SharedElectricityState
 import ua.kropilive.app.data.repository.StartupPreload
+import ua.kropilive.app.data.repository.GasNoticeRepository
+import ua.kropilive.app.data.repository.SharedGasState
 import ua.kropilive.app.data.repository.WaterNoticeRepository
 import ua.kropilive.app.data.repository.WaterReport
 import ua.kropilive.app.data.repository.AirAlertRepository
@@ -70,6 +75,24 @@ private val AccentBlue = Color(0xFF38BDF8)
 private val AccentYellow = Color(0xFFFACC15)
 private val MutedBlue = Color(0xFF94A3B8)
 private val DarkBlue = Color(0xFF1E293B)
+
+// Water status survives bottom-tab navigation and is always tied to the selected address.
+private object HomeWaterSession {
+    private var key: String = ""
+    private var report: WaterReport? = null
+
+    private fun addressKey(a: UserAddress): String =
+        listOf(a.communityId, a.cityName, a.street, a.building).joinToString("|")
+
+    fun get(a: UserAddress): WaterReport? =
+        report?.takeIf { key == addressKey(a) }
+
+    fun save(a: UserAddress, value: WaterReport) {
+        if (a.street.isBlank() || a.building.isBlank() || !value.addressSpecified) return
+        key = addressKey(a)
+        report = value
+    }
+}
 
 // Keeps the last successful checks while Home is temporarily removed from composition
 // when the user switches bottom-navigation tabs. Never reuse yesterday's results.
@@ -121,6 +144,7 @@ fun HomeScreen(
     onWeatherClick: () -> Unit = {},
     onWaterClick: () -> Unit = {},
     onEcostyleClick: () -> Unit = {},
+    onGasClick: () -> Unit = {},
     initialAirAlert: AirAlertState? = null,
     initialAirElapsed: Long = 0L,
     onAirAlertLoaded: (AirAlertState, Long) -> Unit = { _, _ -> }
@@ -143,18 +167,41 @@ fun HomeScreen(
 
     var waterReport by remember { mutableStateOf<WaterReport?>(null) }
     var waterError by remember { mutableStateOf(false) }
-    LaunchedEffect(savedAddress.street, savedAddress.building, savedAddress.cityName) {
-        waterReport = StartupPreload.water(savedAddress)
+    LaunchedEffect(savedAddress.communityId, savedAddress.street, savedAddress.building, savedAddress.cityName) {
+        if (savedAddress.street.isBlank() || savedAddress.building.isBlank()) {
+            waterReport = null
+            waterError = false
+            return@LaunchedEffect
+        }
+        // Restore the verified result for this exact address before requesting anything.
+        waterReport = HomeWaterSession.get(savedAddress) ?: StartupPreload.water(savedAddress)
+        waterReport?.let { HomeWaterSession.save(savedAddress, it) }
+        waterError = false
         while (true) {
             try {
-                // Always refresh, even when startup cache exists. A failed fetch
-                // must not erase a previously valid result.
-                waterReport = WaterNoticeRepository.load(savedAddress)
+                val loaded = WaterNoticeRepository.load(savedAddress)
+                waterReport = loaded
+                HomeWaterSession.save(savedAddress, loaded)
                 waterError = false
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
             } catch (_: Exception) {
                 waterError = waterReport == null
             }
             delay(if (waterError) 15_000L else 5 * 60_000L)
+        }
+    }
+
+    val gasReport = SharedGasState.forAddress(savedAddress)
+    LaunchedEffect(savedAddress.communityId, savedAddress.cityName, savedAddress.street, savedAddress.building) {
+        if (!savedAddress.isFilled) return@LaunchedEffect
+        while (true) {
+            try {
+                SharedGasState.begin(savedAddress)
+                SharedGasState.publish(savedAddress, GasNoticeRepository.load(savedAddress))
+            } catch (e: kotlinx.coroutines.CancellationException) { throw e }
+            catch (_: Exception) { SharedGasState.finish() }
+            delay(5 * 60_000L)
         }
     }
 
@@ -292,6 +339,17 @@ fun HomeScreen(
     HomeElectricitySession.telegramGraph = telegramGraph
     HomeElectricitySession.planned = plannedCheck
     HomeElectricitySession.emergency = emergencyCheck
+    // Publish exactly the values already checked on Home to the schedules tab.
+    // SideEffect runs after a successful composition and performs no network I/O.
+    SideEffect {
+        SharedElectricityState.day = LocalDate.now().toString()
+        SharedElectricityState.queue = queue
+        SharedElectricityState.addressKey = addressKey
+        SharedElectricityState.siteCheck = graphCheck
+        SharedElectricityState.telegramCheck = telegramCheck
+        SharedElectricityState.planned = plannedCheck
+        SharedElectricityState.emergency = emergencyCheck
+    }
     val outageRepository = remember { ElectricityOutageRepository() }
 
     LaunchedEffect(addressKey) {
@@ -391,6 +449,123 @@ fun HomeScreen(
         loadWeather()
     }
 
+    var isRefreshing by remember { mutableStateOf(false) }
+
+    fun refreshHome() {
+        if (isRefreshing) return
+        scope.launch {
+            isRefreshing = true
+            try {
+                // Every source is independent: one failure must not block the others.
+                coroutineScope {
+                    val waterJob = async {
+                        try {
+                            val loaded = WaterNoticeRepository.load(savedAddress)
+                            waterReport = loaded
+                            HomeWaterSession.save(savedAddress, loaded)
+                            waterError = false
+                        } catch (e: kotlinx.coroutines.CancellationException) {
+                            throw e
+                        } catch (_: Exception) {
+                            waterError = waterReport == null
+                        }
+                    }
+                    val airJob = async {
+                        if (!district.isNullOrBlank()) {
+                            try {
+                                val loaded = AirAlertRepository.loadAndCache(district, context)
+                                val elapsed = sourceElapsed(loaded)
+                                if (elapsed > 0L) {
+                                    airAlert = loaded
+                                    airLastSuccessElapsed = elapsed
+                                    alertError = false
+                                    onAirAlertLoaded(loaded, elapsed)
+                                } else {
+                                    alertError = true
+                                }
+                            } catch (e: kotlinx.coroutines.CancellationException) {
+                                throw e
+                            } catch (_: Exception) {
+                                alertError = true
+                            }
+                        }
+                    }
+                    val weatherJob = async {
+                        weatherLoading = true
+                        try {
+                            weather = weatherRepository.getCurrentWeather()
+                            weatherError = false
+                        } catch (e: kotlinx.coroutines.CancellationException) {
+                            throw e
+                        } catch (_: Exception) {
+                            weatherError = true
+                        } finally {
+                            weatherLoading = false
+                        }
+                    }
+                    val electricityJob = async {
+                        if (savedAddress.hasFullAddress) {
+                            val plannedJob = async {
+                                try { outageRepository.fetch(OutageKind.PLANNED, savedAddress) }
+                                catch (e: kotlinx.coroutines.CancellationException) { throw e }
+                                catch (_: Exception) { null }
+                            }
+                            val emergencyJob = async {
+                                try { outageRepository.fetch(OutageKind.EMERGENCY, savedAddress) }
+                                catch (e: kotlinx.coroutines.CancellationException) { throw e }
+                                catch (_: Exception) { null }
+                            }
+                            plannedJob.await()?.let {
+                                plannedCheck = it
+                                HomeElectricitySession.planned = it
+                            }
+                            emergencyJob.await()?.let {
+                                emergencyCheck = it
+                                HomeElectricitySession.emergency = it
+                            }
+                        }
+                        if (queue.isNotBlank()) {
+                            val siteJob = async {
+                                try { HourlyBlackoutRepository.check(context, queue) }
+                                catch (e: kotlinx.coroutines.CancellationException) { throw e }
+                                catch (_: Exception) { null }
+                            }
+                            val telegramJob = async {
+                                try { TelegramBlackoutRepository.check(context, queue) }
+                                catch (e: kotlinx.coroutines.CancellationException) { throw e }
+                                catch (_: Exception) { null }
+                            }
+                            siteJob.await()?.let { checked ->
+                                graphCheck = checked
+                                HomeElectricitySession.site = checked
+                                if (checked is HourlyGraphCheck.Published) {
+                                    siteGraph = checked.graph
+                                    HomeElectricitySession.siteGraph = checked.graph
+                                }
+                            }
+                            telegramJob.await()?.let { channel ->
+                                telegramCheck = channel
+                                HomeElectricitySession.telegram = channel
+                                telegramLiveCheck = (channel as? TelegramGraphCheck.Published)?.graph
+                                telegramLiveCheck?.let {
+                                    telegramGraph = it
+                                    HomeElectricitySession.telegramGraph = it
+                                }
+                            }
+                        }
+                    }
+                    waterJob.await()
+                    airJob.await()
+                    weatherJob.await()
+                    electricityJob.await()
+                }
+                clock = LocalTime.now()
+            } finally {
+                isRefreshing = false
+            }
+        }
+    }
+
     if (showAirDetails) {
         AirAlertDetailsScreen(
             state = visibleAir?.takeIf {
@@ -403,6 +578,8 @@ fun HomeScreen(
     } else if (showElectricityScreen) {
         ElectricityScheduleScreen(
             address = savedAddress,
+            siteCheck = graphCheck,
+            telegramCheck = telegramCheck,
             onBack = {
                 showElectricityScreen = false
             }
@@ -421,10 +598,12 @@ fun HomeScreen(
             airAlert = visibleAir,
             alertError = visibleAirError,
             airLastSuccessElapsed = visibleAirElapsed,
-            waterReport = waterReport,
+            waterReport = if (savedAddress.hasFullAddress) HomeWaterSession.get(savedAddress) else null,
             waterError = waterError,
+            gasReport = gasReport,
             onWaterClick = onWaterClick,
             onEcostyleClick = onEcostyleClick,
+            onGasClick = onGasClick,
             weather = weather,
             weatherLoading = weatherLoading,
             weatherError = weatherError,
@@ -433,11 +612,14 @@ fun HomeScreen(
             onElectricityClick = {
                 showElectricityScreen = true
             },
-            onAirClick = { showAirDetails = true }
+            onAirClick = { showAirDetails = true },
+            isRefreshing = isRefreshing,
+            onRefresh = { refreshHome() }
         )
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun HomeContent(
     address: UserAddress,
@@ -454,15 +636,19 @@ private fun HomeContent(
     airLastSuccessElapsed: Long,
     waterReport: WaterReport?,
     waterError: Boolean,
+    gasReport: ua.kropilive.app.data.repository.GasReport?,
     onWaterClick: () -> Unit,
     onEcostyleClick: () -> Unit,
+    onGasClick: () -> Unit,
     weather: WeatherData?,
     weatherLoading: Boolean,
     weatherError: Boolean,
     onWeatherRefresh: () -> Unit,
     onWeatherClick: () -> Unit,
     onElectricityClick: () -> Unit,
-    onAirClick: () -> Unit
+    onAirClick: () -> Unit,
+    isRefreshing: Boolean,
+    onRefresh: () -> Unit
 ) {
     val today = LocalDate.now().toString()
     val verifiedSite = siteGraph?.takeIf { it.date == today && !it.cached }
@@ -510,7 +696,7 @@ private fun HomeContent(
     }
     val electricityStatusColor = when (electricityValue) {
         "Є відключення" -> Color(0xFFD94848)
-        "Відключень немає" -> Color(0xFF22A05A)
+        "Відключень немає" -> if (isSystemInDarkTheme()) Color(0xFF22A05A) else Color(0xFF187542)
         else -> null
     }
     val electricitySource = when {
@@ -530,403 +716,445 @@ private fun HomeContent(
         else -> "Перевірка джерел"
     }
 
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(MaterialTheme.colorScheme.background)
-            .verticalScroll(rememberScrollState())
-            .padding(16.dp),
-        verticalArrangement = Arrangement.spacedBy(14.dp)
+    PullToRefreshBox(
+        isRefreshing = isRefreshing,
+        onRefresh = onRefresh,
+        modifier = Modifier.fillMaxSize()
     ) {
-        Spacer(Modifier.height(6.dp))
-
-        Text(
-            text = "КропLive",
-            style = MaterialTheme.typography.headlineMedium,
-            fontWeight = FontWeight.Bold
-        )
-
-        Row(
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(5.dp)
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(MaterialTheme.colorScheme.background)
+                .verticalScroll(rememberScrollState())
+                .padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(14.dp)
         ) {
-            Icon(
-                imageVector = Icons.Default.LocationOn,
-                contentDescription = null,
-                tint = AccentBlue,
-                modifier = Modifier.size(15.dp)
-            )
+            Spacer(Modifier.height(6.dp))
 
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = "Кроп Live",
+                    style = MaterialTheme.typography.headlineMedium,
+                    fontWeight = FontWeight.Bold
+                )
+
+                val homeContext = LocalContext.current
+                val appVersion = remember(homeContext) {
+                    runCatching {
+                        val info = homeContext.packageManager.getPackageInfo(homeContext.packageName, 0)
+                        info.versionName ?: "—"
+                    }.getOrDefault("—")
+                }
+                Text(
+                    text = "v$appVersion",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(5.dp)
+            ) {
+                Icon(
+                    imageVector = Icons.Default.LocationOn,
+                    contentDescription = null,
+                    tint = AccentBlue,
+                    modifier = Modifier.size(15.dp)
+                )
+
+                Text(
+                    text = "Кіровоградська область · Усе важливе поруч",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+
+            Spacer(Modifier.height(4.dp))
+
+            // A status older than 2.5 minutes must not be presented as current.
+            val freshAir = airAlert != null && airLastSuccessElapsed > 0L &&
+                    SystemClock.elapsedRealtime() - airLastSuccessElapsed < 150_000L
+            val level = if (freshAir) airAlert!!.level else AirAlertLevel.UNKNOWN
+            val alertPalette = KropiLiveStatusTheme.airAlerts
+            val alertColors = when (level) {
+                AirAlertLevel.RED -> alertPalette.red
+                AirAlertLevel.YELLOW -> alertPalette.yellow
+                AirAlertLevel.GREEN -> alertPalette.green
+                AirAlertLevel.UNKNOWN -> alertPalette.unknown
+            }
+            val alertValue = when (level) {
+                AirAlertLevel.RED -> "Повітряна тривога!"
+                AirAlertLevel.YELLOW -> "Підвищена небезпека"
+                AirAlertLevel.GREEN -> "Немає тривоги"
+                AirAlertLevel.UNKNOWN -> when {
+                    alertError -> "Немає зв'язку з джерелом"
+                    airAlert == null -> "Перевірка статусу…"
+                    !freshAir -> "Дані застаріли"
+                    else -> "Статус не підтверджено"
+                }
+            }
+            val formatAlertTime = remember { SimpleDateFormat("dd.MM HH:mm", Locale("uk", "UA")) }
+            val alertDescription = when (level) {
+                AirAlertLevel.RED -> "${airAlert?.district.orEmpty()} · Початок: " +
+                        (airAlert?.startedAt?.let { formatAlertTime.format(Date(it * 1000)) } ?: "час невідомий")
+                AirAlertLevel.YELLOW -> "${airAlert?.district.orEmpty()} · Повідомлення про загрози: ${airAlert?.threats?.size ?: 0}"
+                AirAlertLevel.GREEN -> "${airAlert?.district.orEmpty()} · Активної тривоги не зафіксовано"
+                AirAlertLevel.UNKNOWN -> when {
+                    alertError -> "Помилка завантаження. Перевірте інтернет та офіційні сповіщення"
+                    airAlert == null -> "Очікуємо відповідь NEPTUN. Перевіряйте офіційні сповіщення"
+                    !freshAir -> "Остання перевірка понад 150 с тому. Перевіряйте офіційні сповіщення"
+                    else -> "Немає достатньо даних для підтвердження статусу"
+                }
+            }
+            HomeInfoCard(
+                icon = when (level) {
+                    AirAlertLevel.RED, AirAlertLevel.YELLOW -> Icons.Default.Warning
+                    AirAlertLevel.GREEN -> Icons.Default.Security
+                    AirAlertLevel.UNKNOWN -> if (alertError) Icons.Default.WifiOff else Icons.Default.CloudOff
+                },
+                iconColor = alertColors.accent,
+                title = "Повітряна небезпека",
+                value = alertValue,
+                description = alertDescription,
+                modifier = Modifier.fillMaxWidth(),
+                onClick = onAirClick,
+                statusColors = alertColors,
+                iconTitleInline = true
+            )
+            val uriHandler = LocalUriHandler.current
             Text(
-                text = "Кіровоградська область · Усе важливе поруч",
-                style = MaterialTheme.typography.bodySmall,
+                text = "Джерело: NEPTUN · Оновлення під час роботи застосунку щохвилини. Не замінює офіційні сигнали тривоги. Відкрити джерело ↗",
+                modifier = Modifier.clickable { uriHandler.openUri(AirAlertRepository.SOURCE) },
+                style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
-        }
 
-        Spacer(Modifier.height(4.dp))
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                HomeInfoCard(
+                    icon = if (electricityValue == "Є відключення") Icons.Default.FlashOff
+                    else Icons.Default.FlashOn,
+                    iconColor = AccentYellow,
+                    title = "Світло",
+                    value = electricityValue,
+                    description = electricitySource,
+                    modifier = Modifier.weight(1f),
+                    onClick = onElectricityClick,
+                    highlighted = true,
+                    valueColor = electricityStatusColor,
+                    cardHeight = 208.dp,
+                    descriptionMaxLines = 2,
+                    queueLabel = if (address.electricityQueue.isBlank()) "Черга не визначена"
+                    else "Черга ${address.electricityQueue}"
+                )
 
-        // A status older than 2.5 minutes must not be presented as current.
-        val freshAir = airAlert != null && airLastSuccessElapsed > 0L &&
-                SystemClock.elapsedRealtime() - airLastSuccessElapsed < 150_000L
-        val level = if (freshAir) airAlert!!.level else AirAlertLevel.UNKNOWN
-        val alertPalette = KropiLiveStatusTheme.airAlerts
-        val alertColors = when (level) {
-            AirAlertLevel.RED -> alertPalette.red
-            AirAlertLevel.YELLOW -> alertPalette.yellow
-            AirAlertLevel.GREEN -> alertPalette.green
-            AirAlertLevel.UNKNOWN -> alertPalette.unknown
-        }
-        val alertValue = when (level) {
-            AirAlertLevel.RED -> "Повітряна тривога!"
-            AirAlertLevel.YELLOW -> "Підвищена небезпека"
-            AirAlertLevel.GREEN -> "Немає тривоги"
-            AirAlertLevel.UNKNOWN -> when {
-                alertError -> "Немає зв'язку з джерелом"
-                airAlert == null -> "Перевірка статусу…"
-                !freshAir -> "Дані застаріли"
-                else -> "Статус не підтверджено"
+                HomeInfoCard(
+                    icon = Icons.Default.WaterDrop,
+                    iconColor = AccentBlue,
+                    title = "Вода",
+                    value = when {
+                        !address.hasFullAddress -> "Оберіть адресу"
+                        waterReport == null && waterError -> "Немає даних"
+                        waterReport == null || !waterReport.addressSpecified -> "Перевірка…"
+                        waterReport.hasReportedIssue -> "Є повідомлення"
+                        else -> "Відключень немає"
+                    },
+                    description = "За повідомленнями водоканалу",
+                    modifier = Modifier.weight(1f),
+                    onClick = onWaterClick,
+                    cardHeight = 208.dp,
+                    valueColor = when {
+                        waterReport?.hasReportedIssue == true -> Color(0xFFD94848)
+                        waterReport != null && !waterError && waterReport.addressSpecified -> Color(0xFF22A05A)
+                        else -> null
+                    }
+                )
             }
-        }
-        val formatAlertTime = remember { SimpleDateFormat("dd.MM HH:mm", Locale("uk", "UA")) }
-        val alertDescription = when (level) {
-            AirAlertLevel.RED -> "${airAlert?.district.orEmpty()} · Початок: " +
-                    (airAlert?.startedAt?.let { formatAlertTime.format(Date(it * 1000)) } ?: "час невідомий")
-            AirAlertLevel.YELLOW -> "${airAlert?.district.orEmpty()} · Повідомлення про загрози: ${airAlert?.threats?.size ?: 0}"
-            AirAlertLevel.GREEN -> "${airAlert?.district.orEmpty()} · Активної тривоги не зафіксовано"
-            AirAlertLevel.UNKNOWN -> when {
-                alertError -> "Помилка завантаження. Перевірте інтернет та офіційні сповіщення"
-                airAlert == null -> "Очікуємо відповідь NEPTUN. Перевіряйте офіційні сповіщення"
-                !freshAir -> "Остання перевірка понад 150 с тому. Перевіряйте офіційні сповіщення"
-                else -> "Немає достатньо даних для підтвердження статусу"
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                HomeInfoCard(
+                    icon = Icons.Default.LocalFireDepartment,
+                    iconColor = Color(0xFFF97316),
+                    title = "Газ",
+                    value = when {
+                        !address.isFilled -> "Оберіть адресу"
+                        gasReport == null || !gasReport.verified -> "Перевірка повідомлень"
+                        gasReport.hasReportedIssue -> "Є повідомлення про відключення"
+                        gasReport.hasUpcomingOutage -> "Заплановане відключення"
+                        else -> "Відключень немає"
+                    },
+                    description = gasReport?.scheduled?.minByOrNull { it.startDate }?.let {
+                        "Дата: ${it.startDate.format(DateTimeFormatter.ofPattern("dd.MM.yyyy"))}"
+                    } ?: "За даними Газмережі",
+                    modifier = Modifier.weight(1f),
+                    onClick = onGasClick,
+                    cardHeight = 170.dp,
+                    valueColor = when {
+                        gasReport?.verified != true -> null
+                        gasReport.hasReportedIssue -> Color(0xFFD94848)
+                        gasReport.hasUpcomingOutage -> if (isSystemInDarkTheme()) Color(0xFFFBBF24) else Color(0xFF9A5700)
+                        else -> if (isSystemInDarkTheme()) Color(0xFF22A05A) else Color(0xFF187542)
+                    }
+                )
+
+                HomeInfoCard(
+                    icon = Icons.Default.DeleteOutline,
+                    iconColor = Color(0xFF22C55E),
+                    title = "Екостайл",
+                    value = "Вивезення відходів",
+                    description = "Графіки та оголошення",
+                    modifier = Modifier.weight(1f),
+                    onClick = onEcostyleClick
+                )
             }
-        }
-        HomeInfoCard(
-            icon = when (level) {
-                AirAlertLevel.RED, AirAlertLevel.YELLOW -> Icons.Default.Warning
-                AirAlertLevel.GREEN -> Icons.Default.Security
-                AirAlertLevel.UNKNOWN -> if (alertError) Icons.Default.WifiOff else Icons.Default.CloudOff
-            },
-            iconColor = alertColors.accent,
-            title = "Повітряна небезпека",
-            value = alertValue,
-            description = alertDescription,
-            modifier = Modifier.fillMaxWidth(),
-            onClick = onAirClick,
-            statusColors = alertColors
-        )
-        val uriHandler = LocalUriHandler.current
-        Text(
-            text = "Джерело: NEPTUN · Оновлення під час роботи застосунку щохвилини. Не замінює офіційні сигнали тривоги. Відкрити джерело ↗",
-            modifier = Modifier.clickable { uriHandler.openUri(AirAlertRepository.SOURCE) },
-            style = MaterialTheme.typography.labelSmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant
-        )
 
-        Row(
-            horizontalArrangement = Arrangement.spacedBy(12.dp)
-        ) {
-            HomeInfoCard(
-                icon = if (electricityValue == "Є відключення") Icons.Default.FlashOff
-                else Icons.Default.FlashOn,
-                iconColor = AccentYellow,
-                title = "Світло",
-                value = electricityValue,
-                description = electricitySource,
-                modifier = Modifier.weight(1f),
-                onClick = onElectricityClick,
-                highlighted = true,
-                valueColor = electricityStatusColor,
-                cardHeight = 208.dp,
-                descriptionMaxLines = 2,
-                queueLabel = if (address.electricityQueue.isBlank()) "Черга не визначена"
-                else "Черга ${address.electricityQueue}"
-            )
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                HomeInfoCard(
+                    icon = Icons.Default.DirectionsBus,
+                    iconColor = Color(0xFFA5B4FC),
+                    title = "Транспорт",
+                    value = "Маршрути",
+                    description = "Зміни руху",
+                    modifier = Modifier.weight(1f)
+                )
 
-            HomeInfoCard(
-                icon = Icons.Default.WaterDrop,
-                iconColor = AccentBlue,
-                title = "Вода",
-                value = when {
-                    waterReport == null && waterError -> "Немає даних"
-                    waterReport == null -> "Перевірка…"
-                    !waterReport.addressSpecified -> "Оберіть адресу"
-                    waterReport.hasReportedIssue -> "Є повідомлення"
-                    else -> "Відключень немає"
-                },
-                description = "За повідомленнями водоканалу",
-                modifier = Modifier.weight(1f),
-                onClick = onWaterClick,
-                cardHeight = 208.dp,
-                valueColor = when {
-                    waterReport?.hasReportedIssue == true -> Color(0xFFD94848)
-                    waterReport != null && !waterError && waterReport.addressSpecified -> Color(0xFF22A05A)
-                    else -> null
+                HomeInfoCard(
+                    icon = Icons.Default.Article,
+                    iconColor = MutedBlue,
+                    title = "Місто",
+                    value = "Оголошення",
+                    description = "Міські новини",
+                    modifier = Modifier.weight(1f)
+                )
+            }
+
+            Spacer(Modifier.height(6.dp))
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = "Погода зараз",
+                    style = MaterialTheme.typography.titleLarge,
+                    fontWeight = FontWeight.Bold
+                )
+
+                TextButton(onClick = onWeatherClick) {
+                    Text("Детальніше")
+                    Icon(
+                        imageVector = Icons.Default.ChevronRight,
+                        contentDescription = null,
+                        modifier = Modifier.size(18.dp)
+                    )
                 }
-            )
-        }
+            }
 
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(12.dp)
-        ) {
-            HomeInfoCard(
-                icon = Icons.Default.LocalFireDepartment,
-                iconColor = Color(0xFFF97316),
-                title = "Газ",
-                value = "Газопостачання",
-                description = "Інформація про газ",
-                modifier = Modifier.weight(1f)
-            )
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                onClick = onWeatherClick,
+                shape = RoundedCornerShape(22.dp),
+                colors = CardDefaults.cardColors(
+                    containerColor = MaterialTheme.colorScheme.surfaceContainerHigh
+                )
+            ) {
+                when {
+                    weather == null && weatherLoading -> {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(24.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(14.dp)
+                        ) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(26.dp),
+                                strokeWidth = 3.dp
+                            )
 
-            HomeInfoCard(
-                icon = Icons.Default.DeleteOutline,
-                iconColor = Color(0xFF22C55E),
-                title = "Екостайл",
-                value = "Вивезення відходів",
-                description = "Графіки та оголошення",
-                modifier = Modifier.weight(1f),
-                onClick = onEcostyleClick
-            )
-        }
+                            Text(
+                                text = "Завантаження погоди...",
+                                color = MaterialTheme.colorScheme.onSurface
+                            )
+                        }
+                    }
 
-        Row(
-            horizontalArrangement = Arrangement.spacedBy(12.dp)
-        ) {
-            HomeInfoCard(
-                icon = Icons.Default.DirectionsBus,
-                iconColor = Color(0xFFA5B4FC),
-                title = "Транспорт",
-                value = "Маршрути",
-                description = "Зміни руху",
-                modifier = Modifier.weight(1f)
-            )
+                    weather == null -> {
+                        Column(
+                            modifier = Modifier.padding(20.dp),
+                            verticalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.CloudOff,
+                                contentDescription = null,
+                                tint = MutedBlue,
+                                modifier = Modifier.size(30.dp)
+                            )
 
-            HomeInfoCard(
-                icon = Icons.Default.Article,
-                iconColor = MutedBlue,
-                title = "Місто",
-                value = "Оголошення",
-                description = "Міські новини",
-                modifier = Modifier.weight(1f)
-            )
-        }
+                            Text(
+                                text = "Погода недоступна",
+                                color = MaterialTheme.colorScheme.onSurface,
+                                fontWeight = FontWeight.Bold
+                            )
 
-        Spacer(Modifier.height(6.dp))
+                            Text(
+                                text = "Не вдалося отримати дані Open-Meteo",
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                style = MaterialTheme.typography.bodySmall
+                            )
+                        }
+                    }
 
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
+                    else -> {
+                        Column(
+                            modifier = Modifier.padding(20.dp),
+                            verticalArrangement = Arrangement.spacedBy(14.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column(
+                                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                                ) {
+                                    Text(
+                                        text = "Кропивницький",
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        style = MaterialTheme.typography.bodySmall
+                                    )
+
+                                    Text(
+                                        text = "${weather.temperature.roundToInt()}°",
+                                        color = MaterialTheme.colorScheme.onSurface,
+                                        fontSize = 48.sp,
+                                        lineHeight = 52.sp,
+                                        fontWeight = FontWeight.Light
+                                    )
+
+                                    Text(
+                                        text = weather.description,
+                                        color = MaterialTheme.colorScheme.onSurface,
+                                        fontWeight = FontWeight.SemiBold
+                                    )
+
+                                    Text(
+                                        text = "Відчувається як " +
+                                                "${weather.feelsLike.roundToInt()}°",
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        style = MaterialTheme.typography.bodySmall
+                                    )
+                                }
+
+                                HomeWeatherIcon(
+                                    code = weather.weatherCode,
+                                    isDay = weather.isDay
+                                )
+                            }
+
+                            HorizontalDivider(
+                                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.12f)
+                            )
+
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(5.dp)
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.WaterDrop,
+                                        contentDescription = null,
+                                        tint = AccentBlue,
+                                        modifier = Modifier.size(16.dp)
+                                    )
+
+                                    Text(
+                                        text = "${weather.humidity}%",
+                                        color = MaterialTheme.colorScheme.onSurface,
+                                        style = MaterialTheme.typography.bodySmall
+                                    )
+                                }
+
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(5.dp)
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.Air,
+                                        contentDescription = null,
+                                        tint = AccentBlue,
+                                        modifier = Modifier.size(16.dp)
+                                    )
+
+                                    Text(
+                                        text = "${weather.windSpeed.roundToInt()} км/год",
+                                        color = MaterialTheme.colorScheme.onSurface,
+                                        style = MaterialTheme.typography.bodySmall
+                                    )
+                                }
+                            }
+
+                            if (weatherError) {
+                                Text(
+                                    text = "Не вдалося оновити прогноз",
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    style = MaterialTheme.typography.labelSmall
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (weather == null && !weatherLoading) {
+                OutlinedButton(
+                    onClick = onWeatherRefresh,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Refresh,
+                        contentDescription = null,
+                        modifier = Modifier.size(18.dp)
+                    )
+
+                    Spacer(Modifier.width(8.dp))
+
+                    Text("Повторити завантаження")
+                }
+            }
+
+            Spacer(Modifier.height(6.dp))
+
             Text(
-                text = "Погода зараз",
+                text = "Важливе для вас",
                 style = MaterialTheme.typography.titleLarge,
                 fontWeight = FontWeight.Bold
             )
 
-            TextButton(onClick = onWeatherClick) {
-                Text("Детальніше")
-                Icon(
-                    imageVector = Icons.Default.ChevronRight,
-                    contentDescription = null,
-                    modifier = Modifier.size(18.dp)
-                )
-            }
-        }
-
-        Card(
-            modifier = Modifier.fillMaxWidth(),
-            onClick = onWeatherClick,
-            shape = RoundedCornerShape(22.dp),
-            colors = CardDefaults.cardColors(
-                containerColor = MaterialTheme.colorScheme.surfaceContainerHigh
+            Text(
+                text = "Тут з'являться персональні повідомлення " +
+                        "про зміни у вашому місті.",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                style = MaterialTheme.typography.bodyMedium
             )
-        ) {
-            when {
-                weather == null && weatherLoading -> {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(24.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(14.dp)
-                    ) {
-                        CircularProgressIndicator(
-                            modifier = Modifier.size(26.dp),
-                            strokeWidth = 3.dp
-                        )
 
-                        Text(
-                            text = "Завантаження погоди...",
-                            color = MaterialTheme.colorScheme.onSurface
-                        )
-                    }
-                }
-
-                weather == null -> {
-                    Column(
-                        modifier = Modifier.padding(20.dp),
-                        verticalArrangement = Arrangement.spacedBy(10.dp)
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.CloudOff,
-                            contentDescription = null,
-                            tint = MutedBlue,
-                            modifier = Modifier.size(30.dp)
-                        )
-
-                        Text(
-                            text = "Погода недоступна",
-                            color = MaterialTheme.colorScheme.onSurface,
-                            fontWeight = FontWeight.Bold
-                        )
-
-                        Text(
-                            text = "Не вдалося отримати дані Open-Meteo",
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            style = MaterialTheme.typography.bodySmall
-                        )
-                    }
-                }
-
-                else -> {
-                    Column(
-                        modifier = Modifier.padding(20.dp),
-                        verticalArrangement = Arrangement.spacedBy(14.dp)
-                    ) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Column(
-                                verticalArrangement = Arrangement.spacedBy(4.dp)
-                            ) {
-                                Text(
-                                    text = "Кропивницький",
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    style = MaterialTheme.typography.bodySmall
-                                )
-
-                                Text(
-                                    text = "${weather.temperature.roundToInt()}°",
-                                    color = MaterialTheme.colorScheme.onSurface,
-                                    fontSize = 48.sp,
-                                    lineHeight = 52.sp,
-                                    fontWeight = FontWeight.Light
-                                )
-
-                                Text(
-                                    text = weather.description,
-                                    color = MaterialTheme.colorScheme.onSurface,
-                                    fontWeight = FontWeight.SemiBold
-                                )
-
-                                Text(
-                                    text = "Відчувається як " +
-                                            "${weather.feelsLike.roundToInt()}°",
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    style = MaterialTheme.typography.bodySmall
-                                )
-                            }
-
-                            HomeWeatherIcon(
-                                code = weather.weatherCode,
-                                isDay = weather.isDay
-                            )
-                        }
-
-                        HorizontalDivider(
-                            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.12f)
-                        )
-
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween
-                        ) {
-                            Row(
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(5.dp)
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Default.WaterDrop,
-                                    contentDescription = null,
-                                    tint = AccentBlue,
-                                    modifier = Modifier.size(16.dp)
-                                )
-
-                                Text(
-                                    text = "${weather.humidity}%",
-                                    color = MaterialTheme.colorScheme.onSurface,
-                                    style = MaterialTheme.typography.bodySmall
-                                )
-                            }
-
-                            Row(
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(5.dp)
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Default.Air,
-                                    contentDescription = null,
-                                    tint = AccentBlue,
-                                    modifier = Modifier.size(16.dp)
-                                )
-
-                                Text(
-                                    text = "${weather.windSpeed.roundToInt()} км/год",
-                                    color = MaterialTheme.colorScheme.onSurface,
-                                    style = MaterialTheme.typography.bodySmall
-                                )
-                            }
-                        }
-
-                        if (weatherError) {
-                            Text(
-                                text = "Не вдалося оновити прогноз",
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                style = MaterialTheme.typography.labelSmall
-                            )
-                        }
-                    }
-                }
-            }
+            Spacer(Modifier.height(14.dp))
         }
-
-        if (weather == null && !weatherLoading) {
-            OutlinedButton(
-                onClick = onWeatherRefresh,
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Icon(
-                    imageVector = Icons.Default.Refresh,
-                    contentDescription = null,
-                    modifier = Modifier.size(18.dp)
-                )
-
-                Spacer(Modifier.width(8.dp))
-
-                Text("Повторити завантаження")
-            }
-        }
-
-        Spacer(Modifier.height(6.dp))
-
-        Text(
-            text = "Важливе для вас",
-            style = MaterialTheme.typography.titleLarge,
-            fontWeight = FontWeight.Bold
-        )
-
-        Text(
-            text = "Тут з'являться персональні повідомлення " +
-                    "про зміни у вашому місті.",
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            style = MaterialTheme.typography.bodyMedium
-        )
-
-        Spacer(Modifier.height(14.dp))
     }
 }
 
@@ -944,7 +1172,8 @@ private fun HomeInfoCard(
     valueColor: Color? = null,
     cardHeight: androidx.compose.ui.unit.Dp = 170.dp,
     descriptionMaxLines: Int = 2,
-    queueLabel: String? = null
+    queueLabel: String? = null,
+    iconTitleInline: Boolean = false
 ) {
     Card(
         modifier = modifier,
@@ -963,25 +1192,50 @@ private fun HomeInfoCard(
                 .padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(9.dp)
         ) {
-            Icon(
-                imageVector = icon,
-                contentDescription = null,
-                tint = iconColor,
-                modifier = Modifier.size(27.dp)
-            )
-
-            Text(
-                text = title,
-                color = statusColors?.secondaryText ?: MaterialTheme.colorScheme.onSurfaceVariant,
-                style = MaterialTheme.typography.bodySmall
-            )
-
-            if (queueLabel != null) {
-                Text(
-                    text = queueLabel,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    style = MaterialTheme.typography.bodySmall
+            if (iconTitleInline) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Icon(
+                        imageVector = icon,
+                        contentDescription = null,
+                        tint = iconColor,
+                        modifier = Modifier.size(27.dp)
+                    )
+                    Text(
+                        text = title,
+                        color = statusColors?.secondaryText ?: MaterialTheme.colorScheme.onSurfaceVariant,
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
+            } else {
+                Icon(
+                    imageVector = icon,
+                    contentDescription = null,
+                    tint = iconColor,
+                    modifier = Modifier.size(27.dp)
                 )
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Text(
+                        text = title,
+                        color = statusColors?.secondaryText ?: MaterialTheme.colorScheme.onSurfaceVariant,
+                        style = MaterialTheme.typography.bodySmall,
+                        maxLines = 1
+                    )
+                    if (queueLabel != null) {
+                        Text(
+                            text = queueLabel,
+                            color = if (isSystemInDarkTheme()) AccentBlue else Color(0xFF17699A),
+                            style = MaterialTheme.typography.bodySmall,
+                            fontWeight = FontWeight.SemiBold,
+                            maxLines = 1
+                        )
+                    }
+                }
             }
 
             Text(
@@ -1501,6 +1755,8 @@ private fun NeptunEmbeddedMapScreen(onBack: () -> Unit) {
 @Composable
 private fun ElectricityScheduleScreen(
     address: UserAddress,
+    siteCheck: HourlyGraphCheck?,
+    telegramCheck: TelegramGraphCheck?,
     onBack: () -> Unit
 ) {
     BackHandler(onBack = onBack)
@@ -1548,7 +1804,11 @@ private fun ElectricityScheduleScreen(
                 .padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
-            ua.kropilive.app.ui.schedules.HourlyBlackoutCard(queue = address.electricityQueue)
+            ua.kropilive.app.ui.schedules.HourlyBlackoutCard(
+                queue = address.electricityQueue,
+                siteCheck = siteCheck,
+                telegramCheck = telegramCheck
+            )
 
             Surface(
                 color = MaterialTheme.colorScheme.surfaceContainerLow,

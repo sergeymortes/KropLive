@@ -201,9 +201,6 @@ fun MainNavigation(
         Build.VERSION.SDK_INT < Build.VERSION_CODES.S ||
                 alarmManager.canScheduleExactAlarms()
     }
-    val installPackagesGranted = remember(permissionCheckVersion) {
-        apkInstaller.canInstallPackages()
-    }
 
     val notificationPermissionLauncher =
         rememberLauncherForActivityResult(
@@ -231,6 +228,9 @@ fun MainNavigation(
     // Сохраняем запрос перехода в раздел Екостайл.
     // В следующем шаге подключим его к SchedulesScreen.
     var ecostyleRequested by remember {
+        mutableStateOf(false)
+    }
+    var gasRequested by remember {
         mutableStateOf(false)
     }
     var navigationRequestId by remember {
@@ -443,12 +443,6 @@ fun MainNavigation(
         PermissionSetupScreen(
             notificationGranted = notificationPermissionGranted,
             exactAlarmGranted = exactAlarmGranted,
-            installPackagesGranted = installPackagesGranted,
-            onRequestInstallPackages = {
-                if (!apkInstaller.openInstallPermissionSettings()) {
-                    permissionCheckVersion++
-                }
-            },
             onRequestNotifications = {
                 val runtimePermissionMissing =
                     Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
@@ -539,6 +533,7 @@ fun MainNavigation(
         selectedTab = AppTab.HOME
         waterRequested = false
         ecostyleRequested = false
+        gasRequested = false
     }
 
     Scaffold(
@@ -558,6 +553,7 @@ fun MainNavigation(
                             if (tab != AppTab.SCHEDULES) {
                                 waterRequested = false
                                 ecostyleRequested = false
+                                gasRequested = false
                             }
                         },
                         icon = {
@@ -595,13 +591,22 @@ fun MainNavigation(
                     },
                     onWaterClick = {
                         ecostyleRequested = false
+                        gasRequested = false
                         waterRequested = true
                         navigationRequestId++
                         selectedTab = AppTab.SCHEDULES
                     },
                     onEcostyleClick = {
                         waterRequested = false
+                        gasRequested = false
                         ecostyleRequested = true
+                        navigationRequestId++
+                        selectedTab = AppTab.SCHEDULES
+                    },
+                    onGasClick = {
+                        waterRequested = false
+                        ecostyleRequested = false
+                        gasRequested = true
                         navigationRequestId++
                         selectedTab = AppTab.SCHEDULES
                     }
@@ -613,6 +618,7 @@ fun MainNavigation(
                     SchedulesScreen(
                         openWater = waterRequested,
                         openEcostyle = ecostyleRequested,
+                        openGas = gasRequested,
                         navigationRequestId = navigationRequestId
                     )
                 }
@@ -740,8 +746,6 @@ private fun StartupLoadingScreen(
 private fun PermissionSetupScreen(
     notificationGranted: Boolean,
     exactAlarmGranted: Boolean,
-    installPackagesGranted: Boolean,
-    onRequestInstallPackages: () -> Unit,
     onRequestNotifications: () -> Unit,
     onRequestExactAlarms: () -> Unit,
     onContinue: () -> Unit
@@ -792,18 +796,6 @@ private fun PermissionSetupScreen(
             description = if (exactAlarmGranted) "Точне планування доступне" else "Для нагадувань за 15 хвилин потрібен додатковий дозвіл",
             buttonLabel = "Налаштувати нагадування",
             onRequest = onRequestExactAlarms
-        )
-        Spacer(Modifier.height(12.dp))
-        PermissionStatusCard(
-            title = "Встановлення оновлень",
-            granted = installPackagesGranted,
-            description = if (installPackagesGranted) {
-                "Встановлення оновлень із GitHub дозволено"
-            } else {
-                "Дозвольте Кроп Live встановлювати нові версії із GitHub Releases"
-            },
-            buttonLabel = "Налаштувати дозвіл",
-            onRequest = onRequestInstallPackages
         )
         Spacer(Modifier.height(28.dp))
         Button(onClick = onContinue, modifier = Modifier.fillMaxWidth()) {

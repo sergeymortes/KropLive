@@ -53,6 +53,15 @@ object StartupPreload {
     suspend fun run(address: UserAddress, context: Context) { coroutineScope {
         val k = key(address)
         val appContext = context.applicationContext
+        val gasJob = async {
+            SharedGasState.begin(address)
+            try {
+                withTimeoutOrNull(12_000L) { GasNoticeRepository.load(address) }
+                    ?.let { SharedGasState.publish(address, it) }
+            } catch (e: CancellationException) { throw e }
+            catch (_: Exception) { }
+            finally { SharedGasState.finish() }
+        }
         val waterJob = async {
             try {
                 withTimeoutOrNull(7_000L) { WaterNoticeRepository.load(address) }
@@ -116,6 +125,7 @@ object StartupPreload {
             }
         }
         // All requests run concurrently; each has a timeout and may fail independently.
+        gasJob.await()
         waterJob.await()
         ecoJob.await()
         ecoLocationJob.await()

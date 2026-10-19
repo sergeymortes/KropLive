@@ -17,38 +17,109 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
-import androidx.compose.material3.Icon
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.graphics.luminance
 
 /**
  * Состояние загрузки обновления.
  */
 sealed interface UpdateDownloadState {
     data object Idle : UpdateDownloadState
+
     data class Downloading(
         val progress: Int
     ) : UpdateDownloadState
+
     data object Installing : UpdateDownloadState
+
     data class Failed(
         val message: String
     ) : UpdateDownloadState
 }
 
 /**
+ * Убирает Markdown-разметку из описания GitHub Release,
+ * сохраняя читаемый текст, списки и переносы строк.
+ */
+private fun formatReleaseNotes(markdown: String): String {
+    return markdown
+        .replace("\r\n", "\n")
+        .replace("\r", "\n")
+        .lines()
+        .map { originalLine ->
+            var line = originalLine.trim()
+
+            // Заголовки Markdown: #, ##, ### и т. д.
+            line = line.replace(
+                Regex("^#{1,6}\\s+"),
+                ""
+            )
+
+            // Цитаты Markdown.
+            line = line.replace(
+                Regex("^>\\s?"),
+                ""
+            )
+
+            // Элементы списков.
+            line = line.replace(
+                Regex("^[-*+]\\s+"),
+                "• "
+            )
+
+            // Нумерованные списки оставляем с номером.
+            line = line.replace(
+                Regex("^(\\d+)\\.\\s+"),
+                "$1. "
+            )
+
+            // Ссылки [текст](url) превращаем в текст.
+            line = line.replace(
+                Regex("\\[([^]]+)]\\(([^)]+)\\)"),
+                "$1"
+            )
+
+            // Жирный текст, курсив и inline-код.
+            line = line
+                .replace("**", "")
+                .replace("__", "")
+                .replace("`", "")
+
+            // Горизонтальные разделители.
+            if (
+                line == "---" ||
+                line == "***" ||
+                line == "___"
+            ) {
+                ""
+            } else {
+                line
+            }
+        }
+        .joinToString("\n")
+        .replace(
+            Regex("\n{3,}"),
+            "\n\n"
+        )
+        .trim()
+}
+
+/**
  * Диалог обновления Кроп Live.
  *
- * Цвета автоматически берутся из MaterialTheme.
- * Поддерживает светлую и тёмную темы.
+ * Поддерживает светлую и тёмную темы Material 3.
  */
 @Composable
 fun UpdateDialog(
@@ -114,7 +185,10 @@ fun UpdateDialog(
                     )
                 }
 
-                if (updateInfo.releaseNotes.isNotBlank()) {
+                val formattedNotes =
+                    formatReleaseNotes(updateInfo.releaseNotes)
+
+                if (formattedNotes.isNotBlank()) {
                     HorizontalDivider()
 
                     Text(
@@ -124,7 +198,7 @@ fun UpdateDialog(
                     )
 
                     Text(
-                        text = updateInfo.releaseNotes,
+                        text = formattedNotes,
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -186,10 +260,13 @@ fun UpdateDialog(
                     Spacer(Modifier.width(8.dp))
 
                     Text(
-                        if (downloadState is UpdateDownloadState.Failed)
+                        if (
+                            downloadState is UpdateDownloadState.Failed
+                        ) {
                             "Повторити"
-                        else
+                        } else {
                             "Оновити"
+                        }
                     )
                 }
             }
@@ -208,6 +285,9 @@ fun UpdateDialog(
     )
 }
 
+/**
+ * Карточка текущей или новой версии.
+ */
 @Composable
 private fun VersionCard(
     label: String,
@@ -215,14 +295,25 @@ private fun VersionCard(
     modifier: Modifier = Modifier,
     isNew: Boolean = false
 ) {
+    val isDarkTheme =
+        MaterialTheme.colorScheme.background.luminance() < 0.5f
+
     val backgroundColor = if (isNew) {
-        MaterialTheme.colorScheme.primaryContainer
+        if (isDarkTheme) {
+            Color(0xFF164B32)
+        } else {
+            Color(0xFFD7F5DF)
+        }
     } else {
         MaterialTheme.colorScheme.surfaceContainerHighest
     }
 
     val versionColor = if (isNew) {
-        MaterialTheme.colorScheme.onPrimaryContainer
+        if (isDarkTheme) {
+            Color(0xFFD7F5DF)
+        } else {
+            Color(0xFF14532D)
+        }
     } else {
         MaterialTheme.colorScheme.onSurface
     }
@@ -256,6 +347,9 @@ private fun VersionCard(
     }
 }
 
+/**
+ * Индикатор скачивания APK.
+ */
 @Composable
 private fun DownloadProgress(
     progress: Int

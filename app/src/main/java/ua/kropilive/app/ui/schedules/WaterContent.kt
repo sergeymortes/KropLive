@@ -16,10 +16,14 @@ import androidx.compose.material.icons.filled.ReceiptLong
 import androidx.compose.material.icons.filled.SupportAgent
 import androidx.compose.material.icons.filled.Call
 import androidx.compose.material.icons.filled.Info
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
@@ -33,6 +37,7 @@ fun WaterContent(address: UserAddress, onOpenTariffs: () -> Unit) {
     var report by remember { mutableStateOf<WaterReport?>(null) }
     var error by remember { mutableStateOf(false) }
     var showCabinetWarning by remember { mutableStateOf(false) }
+    var openedNotice by remember { mutableStateOf<WaterNotice?>(null) }
     fun open(url: String) {
         try { context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url))) }
         catch (_: Exception) { }
@@ -51,16 +56,43 @@ fun WaterContent(address: UserAddress, onOpenTariffs: () -> Unit) {
     }
     Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
         Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer), shape = RoundedCornerShape(20.dp)) {
-            Column(Modifier.fillMaxWidth().padding(18.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text("Водопостачання · Дніпро-Кіровоград", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+            Column(Modifier.fillMaxWidth().padding(18.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Icon(Icons.Default.WaterDrop, contentDescription = null, tint = Color(0xFF38BDF8))
+                    Text("Водопостачання · Дніпро-Кіровоград", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                }
                 Text(if (address.isFilled) address.formattedAddress else "Оберіть адресу в налаштуваннях")
-                Text(when {
-                    error -> "Не вдалося отримати повідомлення. Статус води невідомий."
-                    report == null -> "Завантаження повідомлень…"
-                    !report!!.addressSpecified -> "Оберіть адресу для перевірки повідомлень"
-                    report!!.hasReportedIssue -> "Знайдено повідомлення, що може стосуватися адреси"
-                    else -> "У доступних повідомленнях збігів за адресою не знайдено"
-                }, color = MaterialTheme.colorScheme.onSurfaceVariant)
+
+                val status = when {
+                    error -> "Статус не підтверджено"
+                    report == null -> "Перевірка повідомлень…"
+                    !report!!.addressSpecified -> "Оберіть адресу"
+                    report!!.hasReportedIssue -> "Можливе відключення"
+                    else -> "Відключень не оголошено"
+                }
+                val statusColor = when {
+                    error || report == null || !address.isFilled -> MaterialTheme.colorScheme.onSurfaceVariant
+                    report!!.hasReportedIssue -> MaterialTheme.colorScheme.error
+                    androidx.compose.foundation.isSystemInDarkTheme() -> Color(0xFF22A05A)
+                    else -> Color(0xFF187542)
+                }
+                Text(
+                    text = status,
+                    style = MaterialTheme.typography.titleLarge,
+                    fontWeight = FontWeight.Bold,
+                    color = statusColor
+                )
+                Text(
+                    text = when {
+                        error -> "Не вдалося перевірити повідомлення водоканалу."
+                        report == null -> "Отримуємо дані водоканалу."
+                        !report!!.addressSpecified -> "Вкажіть повну адресу для перевірки повідомлень."
+                        report!!.hasReportedIssue -> "У повідомленнях водоканалу знайдено можливий збіг за вашою адресою."
+                        else -> "У перевірених повідомленнях водоканалу збігів за вашою адресою не знайдено. Це не гарантує фактичну наявність води."
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
             }
         }
         Text("Актуальні повідомлення водоканалу", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
@@ -74,7 +106,6 @@ fun WaterContent(address: UserAddress, onOpenTariffs: () -> Unit) {
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
         notices.take(3).forEach { item ->
-            var expanded by remember(item.id) { mutableStateOf(false) }
             val relevant = report?.relevant?.any { it.id == item.id } == true
             Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerLow), shape = RoundedCornerShape(18.dp)) {
                 Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(9.dp)) {
@@ -84,17 +115,13 @@ fun WaterContent(address: UserAddress, onOpenTariffs: () -> Unit) {
                     Text(
                         text = item.text,
                         style = MaterialTheme.typography.bodyMedium,
-                        maxLines = if (expanded) Int.MAX_VALUE else 4,
+                        maxLines = 4,
                         overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
                     )
-                    TextButton(onClick = { expanded = !expanded }, modifier = Modifier.fillMaxWidth()) {
-                        Text(if (expanded) "Згорнути повідомлення" else "Читати повністю")
+                    TextButton(onClick = { openedNotice = item }, modifier = Modifier.fillMaxWidth()) {
+                        Text("Читати повністю")
                         Spacer(Modifier.width(6.dp))
-                        Icon(
-                            if (expanded) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
-                            contentDescription = null,
-                            modifier = Modifier.size(20.dp)
-                        )
+                        Icon(Icons.Default.OpenInNew, contentDescription = null, modifier = Modifier.size(18.dp))
                     }
                 }
             }
@@ -154,6 +181,78 @@ fun WaterContent(address: UserAddress, onOpenTariffs: () -> Unit) {
             }
         }
     }
+    openedNotice?.let { notice ->
+        Dialog(
+            onDismissRequest = { openedNotice = null },
+            properties = DialogProperties(usePlatformDefaultWidth = false)
+        ) {
+            Surface(
+                modifier = Modifier.fillMaxSize(),
+                color = MaterialTheme.colorScheme.background
+            ) {
+                Column(Modifier.fillMaxSize()) {
+                    Row(
+                        Modifier.fillMaxWidth().padding(12.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        IconButton(onClick = { openedNotice = null }) {
+                            Icon(Icons.Default.ArrowBack, contentDescription = "Назад")
+                        }
+                        Text(
+                            "Повідомлення водоканалу",
+                            style = MaterialTheme.typography.titleLarge,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                    Column(
+                        Modifier.weight(1f)
+                            .verticalScroll(rememberScrollState())
+                            .padding(horizontal = 20.dp),
+                        verticalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        Text(
+                            if (notice.restored) "Відновлення водопостачання"
+                            else "Повідомлення про водопостачання",
+                            style = MaterialTheme.typography.headlineSmall,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Text(
+                            "Опубліковано: ${notice.date}",
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        HorizontalDivider()
+                        notice.text.lines().forEach { raw ->
+                            val line = raw.trim()
+                            if (line.isNotEmpty()) {
+                                val heading = line.matches(Regex("""^\\d{1,2}[./]\\d{1,2}(?:[./]\\d{2,4})?.*""")) ||
+                                        line.startsWith("УВАГА", ignoreCase = true) ||
+                                        line.startsWith("Шановні", ignoreCase = true)
+                                Text(
+                                    text = line,
+                                    style = if (heading) MaterialTheme.typography.titleMedium
+                                    else MaterialTheme.typography.bodyLarge,
+                                    fontWeight = if (heading) FontWeight.Bold else FontWeight.Normal,
+                                    color = if (heading) MaterialTheme.colorScheme.primary
+                                    else MaterialTheme.colorScheme.onSurface
+                                )
+                            }
+                        }
+                        HorizontalDivider()
+                        OutlinedButton(
+                            onClick = { open(notice.url) },
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Icon(Icons.Default.OpenInNew, contentDescription = null)
+                            Spacer(Modifier.width(8.dp))
+                            Text("Відкрити оригінал повідомлення")
+                        }
+                        Spacer(Modifier.height(24.dp))
+                    }
+                }
+            }
+        }
+    }
+
     if (showCabinetWarning) {
         AlertDialog(
             onDismissRequest = { showCabinetWarning = false },

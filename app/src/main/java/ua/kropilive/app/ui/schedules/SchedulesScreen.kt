@@ -29,6 +29,22 @@ import ua.kropilive.app.data.repository.OutageRecord
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.async
 
+/** Shared electricity results; HomeScreen publishes, SchedulesScreen only reads. */
+object SharedElectricityState {
+    var addressKey by mutableStateOf("")
+    var queue by mutableStateOf("")
+    var siteCheck by mutableStateOf<ua.kropilive.app.data.repository.HourlyGraphCheck?>(null)
+    var telegramCheck by mutableStateOf<ua.kropilive.app.data.repository.TelegramGraphCheck?>(null)
+    var planned by mutableStateOf<ua.kropilive.app.data.repository.OutageResult?>(null)
+    var emergency by mutableStateOf<ua.kropilive.app.data.repository.OutageResult?>(null)
+    var day by mutableStateOf("")
+
+    fun matches(address: UserAddress): Boolean =
+        day == java.time.LocalDate.now().toString() &&
+                queue == address.electricityQueue &&
+                addressKey == listOf(address.communityId, address.cityName, address.street, address.building).joinToString("|")
+}
+
 private val ElectricityYellow = Color(0xFFFACC15)
 private val WaterBlue = Color(0xFF38BDF8)
 private val GasOrange = Color(0xFFFB923C)
@@ -70,6 +86,7 @@ private enum class UtilityType(
 fun SchedulesScreen(
     openWater: Boolean = false,
     openEcostyle: Boolean = false,
+    openGas: Boolean = false,
     navigationRequestId: Int = 0
 ) {
     val context = LocalContext.current
@@ -86,6 +103,7 @@ fun SchedulesScreen(
         mutableStateOf(
             when {
                 openEcostyle -> UtilityType.WASTE
+                openGas -> UtilityType.GAS
                 openWater -> UtilityType.WATER
                 else -> UtilityType.ELECTRICITY
             }
@@ -95,6 +113,7 @@ fun SchedulesScreen(
     LaunchedEffect(navigationRequestId) {
         when {
             openEcostyle -> selectedType = UtilityType.WASTE
+            openGas -> selectedType = UtilityType.GAS
             openWater -> selectedType = UtilityType.WATER
         }
     }
@@ -102,10 +121,16 @@ fun SchedulesScreen(
     var showEcostyleTariffs by remember { mutableStateOf(false) }
     var showElectricityTariffs by remember { mutableStateOf(false) }
     var showWaterTariffs by remember { mutableStateOf(false) }
-    BackHandler(enabled = showEcostyleTariffs || showElectricityTariffs || showWaterTariffs) {
+    var showGasTariffs by remember { mutableStateOf(false) }
+    BackHandler(enabled = showEcostyleTariffs || showElectricityTariffs || showWaterTariffs || showGasTariffs) {
         showEcostyleTariffs = false
         showElectricityTariffs = false
         showWaterTariffs = false
+        showGasTariffs = false
+    }
+    if (showGasTariffs) {
+        GasTariffsFullScreen(onBack = { showGasTariffs = false })
+        return
     }
     if (showWaterTariffs) {
         WaterTariffsFullScreen(onBack = { showWaterTariffs = false })
@@ -238,14 +263,7 @@ fun SchedulesScreen(
             UtilityType.WATER -> { WaterContent(address = userAddress, onOpenTariffs = { showWaterTariffs = true }) }
 
             UtilityType.GAS -> {
-                UtilityPlaceholder(
-                    title = "Газопостачання",
-                    icon = Icons.Default.LocalFireDepartment,
-                    iconColor = GasOrange,
-                    description = "Тут з'являться повідомлення про " +
-                            "планові та аварійні роботи на газових мережах.",
-                    onOpenSource = ::openOfficialSource
-                )
+                GasContent(address = userAddress, onOpenTariffs = { showGasTariffs = true })
             }
 
             UtilityType.WASTE -> {
@@ -272,49 +290,15 @@ private fun ElectricityContent(
 ) {
     val context = LocalContext.current
     val repository = remember { ElectricityOutageRepository() }
-    val scope = rememberCoroutineScope()
     var selectedKind by remember { mutableStateOf(OutageKind.PLANNED) }
-    var planned by remember { mutableStateOf<ua.kropilive.app.data.repository.OutageResult?>(null) }
-    var emergency by remember { mutableStateOf<ua.kropilive.app.data.repository.OutageResult?>(null) }
-    var plannedError by remember { mutableStateOf<String?>(null) }
-    var emergencyError by remember { mutableStateOf<String?>(null) }
-    var loading by remember { mutableStateOf(false) }
-    var refresh by remember { mutableIntStateOf(0) }
 
-    LaunchedEffect(address.communityId, address.street, address.building, refresh) {
-        planned = StartupPreload.electricity(address, OutageKind.PLANNED)
-        emergency = StartupPreload.electricity(address, OutageKind.EMERGENCY)
-        plannedError = null
-        emergencyError = null
-        if (!address.hasFullAddress) return@LaunchedEffect
-        loading = true
-        // Independent concurrent requests: a timeout in one section must not block the other.
-        kotlinx.coroutines.coroutineScope {
-            val plannedJob = async {
-                if (planned == null || refresh > 0) {
-                    try { planned = repository.fetch(OutageKind.PLANNED, address) }
-                    catch (e: Exception) {
-                        if (e is kotlinx.coroutines.CancellationException) throw e
-                        plannedError = if (e.message?.contains("timeout", true) == true)
-                            "Сервер не відповів вчасно. Спробуйте пізніше." else (e.message ?: "Помилка завантаження")
-                    }
-                }
-            }
-            val emergencyJob = async {
-                if (emergency == null || refresh > 0) {
-                    try { emergency = repository.fetch(OutageKind.EMERGENCY, address) }
-                    catch (e: Exception) {
-                        if (e is kotlinx.coroutines.CancellationException) throw e
-                        emergencyError = if (e.message?.contains("timeout", true) == true)
-                            "Сервер не відповів вчасно. Спробуйте пізніше." else (e.message ?: "Помилка завантаження")
-                    }
-                }
-            }
-            plannedJob.await()
-            emergencyJob.await()
-        }
-        loading = false
-    }
+    // No network calls: use exactly the state already checked on Home.
+    val shared = SharedElectricityState
+    val valid = shared.matches(address)
+    val planned = if (valid) shared.planned else null
+    val emergency = if (valid) shared.emergency else null
+    val siteCheck = if (valid) shared.siteCheck else null
+    val telegramCheck = if (valid) shared.telegramCheck else null
 
     Card(
         modifier = Modifier.fillMaxWidth(),
@@ -338,7 +322,11 @@ private fun ElectricityContent(
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
             HorizontalDivider()
-            HourlyBlackoutCard(queue = address.electricityQueue)
+            HourlyBlackoutCard(
+                queue = address.electricityQueue,
+                siteCheck = siteCheck,
+                telegramCheck = telegramCheck
+            )
             Button(onClick = onOpenSource, modifier = Modifier.fillMaxWidth()) {
                 Icon(Icons.Default.OpenInNew, null)
                 Spacer(Modifier.width(8.dp))
@@ -358,14 +346,9 @@ private fun ElectricityContent(
             onClick = { selectedKind = OutageKind.EMERGENCY },
             label = { Text("Аварійні") }
         )
-        Spacer(Modifier.weight(1f))
-        IconButton(onClick = { refresh++ }, enabled = !loading && address.hasFullAddress) {
-            Icon(Icons.Default.Refresh, "Оновити відключення")
-        }
     }
 
     val result = if (selectedKind == OutageKind.PLANNED) planned else emergency
-    val error = if (selectedKind == OutageKind.PLANNED) plannedError else emergencyError
     Card(
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(20.dp),
@@ -378,9 +361,7 @@ private fun ElectricityContent(
             )
             when {
                 !address.hasFullAddress -> Text("Спочатку виберіть адресу в налаштуваннях")
-                loading && result == null && error == null -> LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
-                error != null -> Text("Не вдалося отримати дані: $error", color = MaterialTheme.colorScheme.error)
-                result == null -> Text("Дані ще не завантажено")
+                result == null -> Text("Очікуємо результатів перевірки на головній.")
                 result.matching.isNotEmpty() -> {
                     result.matching.forEach { record -> OutageRecordCard(record) }
                 }
@@ -403,7 +384,7 @@ private fun ElectricityContent(
             }
         }
     }
-    SourceInfoCard("Джерело: Кіровоградобленерго. Дані завантажуються під час відкриття екрана та за кнопкою оновлення. Перевіряйте інформацію на сайті оператора.")
+    SourceInfoCard("Джерело: Кіровоградобленерго. Дані надходять із перевірки на головній без повторних запитів. Перевіряйте інформацію на сайті оператора.")
     ElectricityContactsSection(onOpenTariffs = onOpenTariffs)
 }
 
@@ -639,6 +620,18 @@ private fun WaterTariffsFullScreen(onBack: () -> Unit) {
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
             WaterTariffsScreen(onBack = onBack, open = ::open)
+        }
+    }
+}
+
+@Composable
+private fun GasTariffsFullScreen(onBack: () -> Unit) {
+    Column(Modifier.fillMaxSize()) {
+        Column(
+            Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp)
+        ) {
+            GasTariffsScreen(onBack = onBack)
         }
     }
 }

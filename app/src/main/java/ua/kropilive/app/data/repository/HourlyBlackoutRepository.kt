@@ -3,6 +3,9 @@ package ua.kropilive.app.data.repository
 import android.content.Context
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import android.os.SystemClock
 import org.json.JSONObject
 import java.net.CookieManager
 import java.net.CookiePolicy
@@ -38,6 +41,20 @@ sealed class HourlyGraphCheck {
 }
 
 object HourlyBlackoutRepository {
+
+    // One request owner for all callers (splash, Home and background tasks).
+    // Keep successful checks for two minutes, including a confirmed missing GPV.
+    private val checkMutex = Mutex()
+    private const val CHECK_TTL_MS = 120_000L
+    private data class RecentCheck(
+        val queue: String,
+        val day: String,
+        val checkedAtElapsed: Long,
+        val result: HourlyGraphCheck
+    )
+    private var recentCheck: RecentCheck? = null
+
+    private const val DIAG_TAG = "KropLiveElectricity"
 
     private const val BASE =
         "https://kiroe.com.ua/electricity-blackout"
@@ -100,6 +117,7 @@ object HourlyBlackoutRepository {
             }
 
         try {
+            Log.d(DIAG_TAG, "HTTP ${if (form == null) "GET" else "POST"} ${url.substringBefore('?')}")
 
             if (form != null) {
                 conn.outputStream.use {
@@ -109,14 +127,18 @@ object HourlyBlackoutRepository {
                 }
             }
 
-            if (conn.responseCode !in 200..299) {
-                error("HTTP ${conn.responseCode}")
+            val httpCode = conn.responseCode
+            Log.d(DIAG_TAG, "HTTP response=$httpCode contentType=${conn.contentType}")
+            if (httpCode !in 200..299) {
+                error("HTTP $httpCode")
             }
 
             cookies?.put(URL(url).toURI(), conn.headerFields.filterKeys { it != null })
-            return conn.inputStream
+            val responseText = conn.inputStream
                 .bufferedReader(Charsets.UTF_8)
                 .use { it.readText() }
+            Log.d(DIAG_TAG, "Response length=${responseText.length} chars")
+            return responseText
 
         } finally {
             conn.disconnect()
@@ -497,8 +519,35 @@ object HourlyBlackoutRepository {
     suspend fun check(
         context: Context,
         queue: String
+    ): HourlyGraphCheck = checkMutex.withLock {
+        if (queue.isBlank()) return@withLock HourlyGraphCheck.Failed
+        val normalized = normalizedQueue(queue)
+        val today = LocalDate.now(kyivZone).toString()
+        val now = SystemClock.elapsedRealtime()
+        val previous = recentCheck
+        if (previous != null && previous.queue == normalized &&
+            previous.day == today && now >= previous.checkedAtElapsed &&
+            now - previous.checkedAtElapsed < CHECK_TTL_MS
+        ) {
+            Log.i(DIAG_TAG, "GPV reuse recent result queue=$normalized ageMs=${now - previous.checkedAtElapsed}")
+            return@withLock previous.result
+        }
+        val result = checkUncached(context, queue)
+        if (result != HourlyGraphCheck.Failed) {
+            recentCheck = RecentCheck(normalized, today, SystemClock.elapsedRealtime(), result)
+        }
+        result
+    }
+
+    private suspend fun checkUncached(
+        context: Context,
+        queue: String
     ): HourlyGraphCheck = withContext(Dispatchers.IO) {
-        if (queue.isBlank()) return@withContext HourlyGraphCheck.Failed
+        Log.i(DIAG_TAG, "GPV check START queue=${queue.trim()}")
+        if (queue.isBlank()) {
+            Log.w(DIAG_TAG, "GPV Failed: queue is blank")
+            return@withContext HourlyGraphCheck.Failed
+        }
 
         val today = LocalDate.now(kyivZone).toString()
         try {
@@ -506,24 +555,42 @@ object HourlyBlackoutRepository {
             // The address picker already preserves these cookies.
             val cookies = CookieManager(null, CookiePolicy.ACCEPT_ORIGINAL_SERVER)
             val html = request(BASE, cookies = cookies)
+            Log.d(DIAG_TAG, "GPV page loaded, htmlLength=${html.length}")
             val token = Regex(
                 """ajaxToken\s*:\s*['"]([^'"]+)['"]"""
             ).find(html)?.groupValues?.get(1)
                 ?: error("Токен запиту не знайдено")
 
+            Log.i(DIAG_TAG, "GPV AJAX token found (value hidden)")
             val body = "ajax=1&token=" + URLEncoder.encode(token, "UTF-8")
-            val response = JSONObject(
-                request(
-                    "$BASE/actual-gpv-graphs?t=${System.currentTimeMillis()}",
-                    body,
-                    cookies
-                )
+            val responseText = request(
+                "$BASE/actual-gpv-graphs?t=${System.currentTimeMillis()}",
+                body,
+                cookies
             )
+            // Only log the short server response; never log cookies or AJAX token.
+            Log.d(DIAG_TAG, "GPV raw JSON: ${responseText.take(500)}")
+            val response = JSONObject(responseText)
 
+            Log.d(DIAG_TAG, "GPV JSON keys=${response.keys().asSequence().toList()}")
+            // The official endpoint uses two representations for an empty graph list:
+            // a PHP-serialized empty array ("a:0:{}") or an empty JSON array ([]).
+            // Both mean no GPV graph was published, not that power is guaranteed.
+            if (response.optBoolean("success", false)) {
+                val serializedEmpty = response.optString("data").trim() == "a:0:{}"
+                val emptyJsonArray = response.optJSONArray("data")?.length() == 0
+                if (serializedEmpty || emptyJsonArray) {
+                    Log.i(DIAG_TAG, "GPV NotPublished: official source returned empty graph list")
+                    return@withContext HourlyGraphCheck.NotPublished
+                }
+            }
             // HTTP 200 alone does not prove that GPV was not published.
             // Validate the response shape before returning NotPublished.
             val data = response.optJSONObject("data")
-                ?: return@withContext HourlyGraphCheck.Failed
+                ?: run {
+                    Log.w(DIAG_TAG, "GPV Failed: JSON has no data object")
+                    return@withContext HourlyGraphCheck.Failed
+                }
             val groups = data.optJSONObject("groups") ?: data
             val q = normalizedQueue(queue)
             val keys = groups.keys()
@@ -537,12 +604,17 @@ object HourlyBlackoutRepository {
                 }
                 if (normalizedQueue(key) == q) matchingEntry = item
             }
+            Log.i(DIAG_TAG, "GPV groups checked queue=$q matched=${matchingEntry != null} recognizable=$hasRecognizableGraph")
             // A queue-specific explicit text notice is a legitimate negative
             // result even when there are no published hourly slots.
             if (matchingEntry != null &&
                 explicitlyNoSchedule(matchingEntry, q, queueContext = true)
-            ) return@withContext HourlyGraphCheck.NotPublished
+            ) {
+                Log.i(DIAG_TAG, "GPV NotPublished: explicit queue notice")
+                return@withContext HourlyGraphCheck.NotPublished
+            }
             if (explicitlyNoSchedule(response, q)) {
+                Log.i(DIAG_TAG, "GPV NotPublished: explicit response notice")
                 return@withContext HourlyGraphCheck.NotPublished
             }
 
@@ -550,10 +622,14 @@ object HourlyBlackoutRepository {
             // evidence that there are no scheduled outages.
             if (!hasRecognizableGraph ||
                 (matchingEntry != null && matchingEntry.optJSONObject("times") == null)
-            ) return@withContext HourlyGraphCheck.Failed
+            ) {
+                Log.w(DIAG_TAG, "GPV Failed: unrecognized graph schema or missing times")
+                return@withContext HourlyGraphCheck.Failed
+            }
 
             val graph = parse(response, queue, today, cached = false)
             if (graph == null) {
+                Log.w(DIAG_TAG, "GPV graph parse null; matched=${matchingEntry != null}")
                 if (matchingEntry != null) HourlyGraphCheck.Failed
                 else HourlyGraphCheck.NotPublished
             } else {
@@ -566,11 +642,13 @@ object HourlyBlackoutRepository {
                     .edit()
                     .putString("group:${graph.group}", stored.toString())
                     .apply()
+                Log.i(DIAG_TAG, "GPV Published queue=${graph.group} slots=${graph.times.size} date=${graph.date}")
                 HourlyGraphCheck.Published(graph)
             }
         } catch (e: kotlinx.coroutines.CancellationException) {
             throw e
         } catch (e: Exception) {
+            Log.e(DIAG_TAG, "GPV Failed queue=$queue: ${e.javaClass.simpleName}: ${e.message}", e)
             Log.w("KropiLive_GPV", "Official GPV check failed: ${e.javaClass.simpleName}: ${e.message}")
             HourlyGraphCheck.Failed
         }

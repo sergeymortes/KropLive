@@ -120,14 +120,16 @@ private fun EcoPointCard(title: String, color: Color, selection: EcostyleSelecti
                 if (rule.kind == "d") {
                     // Daily service has no separately confirmed next pickup date.
                 } else if (rule.kind == "eo" && rule.anchor == null) {
-                    Text("Точні дати чергування не вказані в базі.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    // Дати чергування не уточнюємо у картці.
                 } else {
                     rule.next(ecostyleToday())?.let { date ->
                         Text("Наступний вивіз: ${date.format(DateTimeFormatter.ofPattern("d MMMM yyyy", Locale.forLanguageTag("uk")))}")
                     }
                 }
             }
-            Text(selection.description, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            if (!selection.description.contains("Графік за вулицею (точку збору для будинку не підтверджено)", ignoreCase = true)) {
+                Text(selection.description, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
             selection.point?.let { point ->
                 Text("${street}, ${point.label}", style = MaterialTheme.typography.bodyMedium)
                 selection.distanceMeters?.let { dist ->

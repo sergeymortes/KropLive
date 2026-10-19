@@ -23,24 +23,23 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import ua.kropilive.app.KiroeAddressPicker
 import ua.kropilive.app.data.repository.AddressRepository
+import ua.kropilive.app.data.repository.ElectricityQueueChecker
+import kotlinx.coroutines.launch
 import ua.kropilive.app.data.repository.UserAddress
 import ua.kropilive.app.ui.theme.ThemeMode
 import ua.kropilive.app.background.NotificationPreferences
-import android.app.NotificationChannel
-import android.app.NotificationManager
-import android.app.PendingIntent
-import android.content.Context
 import android.content.Intent
-import android.content.pm.PackageManager
-import androidx.core.app.NotificationCompat
-import androidx.core.app.NotificationManagerCompat
+import android.net.Uri
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 @Composable
 fun SettingsScreen(
     themeMode: ThemeMode,
     onThemeChange: (ThemeMode) -> Unit
 ) {
-    val context = LocalContext.current.applicationContext
+    val context = LocalContext.current
 
     val addressRepository = remember(context) {
         AddressRepository(context)
@@ -58,6 +57,12 @@ fun SettingsScreen(
     var showThemeDialog by remember {
         mutableStateOf(false)
     }
+
+    var showAboutDialog by remember { mutableStateOf(false) }
+    val queueChecker = remember(context) { ElectricityQueueChecker(context) }
+    val scope = rememberCoroutineScope()
+    var checkingQueue by remember { mutableStateOf(false) }
+    var queueCheckResult by remember { mutableStateOf<ElectricityQueueChecker.Result?>(null) }
 
     var infoDialog by remember {
         mutableStateOf<String?>(null)
@@ -230,28 +235,56 @@ fun SettingsScreen(
 
                     OutlinedButton(
                         onClick = {
-                            infoDialog =
-                                "Наступним кроком підключимо автоматичну " +
-                                        "перевірку збереженої адреси на сайті " +
-                                        "обленерго та оновлення черги."
+                            if (!checkingQueue) {
+                                val addressToCheck = savedAddress
+                                checkingQueue = true
+                                scope.launch {
+                                    try {
+                                        val result = queueChecker.check(addressToCheck)
+                                        queueCheckResult = when (result) {
+                                            is ElectricityQueueChecker.Result.Changed -> {
+                                                val saved = addressRepository.updateElectricityQueue(
+                                                    newQueue = result.newQueue,
+                                                    expectedHouseId = addressToCheck.houseId
+                                                )
+                                                if (saved) result else ElectricityQueueChecker.Result.Error(
+                                                    "Адресу було змінено під час перевірки. Спробуйте ще раз."
+                                                )
+                                            }
+                                            else -> result
+                                        }
+                                    } catch (e: Exception) {
+                                        if (e is kotlinx.coroutines.CancellationException) throw e
+                                        queueCheckResult = ElectricityQueueChecker.Result.Error(
+                                            "Не вдалося оновити чергу. Спробуйте ще раз."
+                                        )
+                                    } finally {
+                                        checkingQueue = false
+                                    }
+                                }
+                            }
                         },
-                        enabled = canRefreshQueue,
+                        enabled = canRefreshQueue && !checkingQueue,
                         modifier = Modifier.weight(1f),
                         contentPadding = PaddingValues(
                             horizontal = 8.dp,
                             vertical = 10.dp
                         )
                     ) {
-                        Icon(
-                            imageVector = Icons.Default.Refresh,
-                            contentDescription = null,
-                            modifier = Modifier.size(16.dp)
-                        )
+                        if (checkingQueue) {
+                            CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                        } else {
+                            Icon(
+                                imageVector = Icons.Default.Refresh,
+                                contentDescription = null,
+                                modifier = Modifier.size(16.dp)
+                            )
+                        }
 
                         Spacer(Modifier.width(6.dp))
 
                         Text(
-                            text = "Оновити чергу",
+                            text = if (checkingQueue) "Перевірка..." else "Оновити чергу",
                             maxLines = 1,
                             style = MaterialTheme.typography.labelMedium
                         )
@@ -305,7 +338,7 @@ fun SettingsScreen(
                     onClick = {
                         infoDialog =
                             "Тут будуть налаштування оновлення " +
-                                    "даних КропLive."
+                                    "даних Кроп Live."
                     }
                 )
             }
@@ -322,19 +355,68 @@ fun SettingsScreen(
         ) {
             SettingsMenuItem(
                 icon = Icons.Default.Info,
-                title = "КропLive",
-                subtitle = "Версія, джерела даних та інформація",
+                title = "Кроп Live",
+                subtitle = "Версія, розробник та інформація",
+                onClick = { showAboutDialog = true }
+            )
+        }
+
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(20.dp),
+            colors = CardDefaults.cardColors(
+                containerColor = MaterialTheme.colorScheme.surfaceContainer
+            )
+        ) {
+            SettingsMenuItem(
+                icon = Icons.Default.Share,
+                title = "Поділитися застосунком",
+                subtitle = "Надіслати посилання на завантаження",
                 onClick = {
-                    infoDialog =
-                        "КропLive — інформаційний застосунок " +
-                                "для Кіровоградської області.\n\n" +
-                                "Тут згодом з'являться версія застосунку, " +
-                                "джерела даних та інша інформація."
+                    val apkUrl = "https://github.com/sergeymortes/KropLive/releases/latest/download/app-release.apk"
+                    val shareIntent = Intent(Intent.ACTION_SEND).apply {
+                        type = "text/plain"
+                        putExtra(Intent.EXTRA_SUBJECT, "Кроп Live")
+                        putExtra(Intent.EXTRA_TEXT, "Завантажити Кроп Live:\n$apkUrl")
+                    }
+                    context.startActivity(
+                        Intent.createChooser(shareIntent, "Поділитися Кроп Live")
+                    )
                 }
             )
         }
 
         Spacer(Modifier.height(12.dp))
+    }
+
+    queueCheckResult?.let { result ->
+        val (title, message) = when (result) {
+            is ElectricityQueueChecker.Result.Unchanged ->
+                "Черга не змінилася" to "За вашою адресою залишається черга ${result.queue}. Дані перевірено."
+            is ElectricityQueueChecker.Result.Changed ->
+                "Чергу змінено" to "Попередня черга: ${result.previousQueue.ifBlank { "не визначена" }}\nНова черга: ${result.newQueue}.\n\nДані збережено."
+            is ElectricityQueueChecker.Result.Error ->
+                "Не вдалося перевірити чергу" to result.message
+        }
+        AlertDialog(
+            onDismissRequest = { queueCheckResult = null },
+            icon = {
+                Icon(
+                    imageVector = when (result) {
+                        is ElectricityQueueChecker.Result.Unchanged -> Icons.Default.CheckCircle
+                        is ElectricityQueueChecker.Result.Changed -> Icons.Default.Sync
+                        is ElectricityQueueChecker.Result.Error -> Icons.Default.WarningAmber
+                    },
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.primary
+                )
+            },
+            title = { Text(title) },
+            text = { Text(message) },
+            confirmButton = {
+                TextButton(onClick = { queueCheckResult = null }) { Text("Зрозуміло") }
+            }
+        )
     }
 
     if (showThemeDialog) {
@@ -402,13 +484,100 @@ fun SettingsScreen(
         )
     }
 
+    if (showAboutDialog) {
+        val packageInfo = remember(context) {
+            runCatching { context.packageManager.getPackageInfo(context.packageName, 0) }
+                .getOrNull()
+        }
+        val version = packageInfo?.versionName ?: "Невідомо"
+        val updatedAt = packageInfo?.lastUpdateTime
+            ?.takeIf { it > 0L }
+            ?.let {
+                SimpleDateFormat("dd.MM.yyyy", Locale("uk", "UA")).format(Date(it))
+            } ?: "Невідомо"
+
+        AlertDialog(
+            onDismissRequest = { showAboutDialog = false },
+            icon = {
+                Icon(
+                    imageVector = Icons.Default.Bolt,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.size(32.dp)
+                )
+            },
+            title = {
+                Text(
+                    text = "Кроп Live",
+                    style = MaterialTheme.typography.headlineSmall,
+                    fontWeight = FontWeight.Bold
+                )
+            },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Text(
+                        text = "Інформаційний застосунок для Кропивницького та Кіровоградської області",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    HorizontalDivider()
+                    AboutInfoRow("Версія", version)
+                    AboutInfoRow("Рік", "2026")
+                    AboutInfoRow("Останнє оновлення", updatedAt)
+                    HorizontalDivider()
+                    Text(
+                        text = "Розробник",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Surface(
+                        onClick = {
+                            val link = Intent(
+                                Intent.ACTION_VIEW,
+                                Uri.parse("https://github.com/sergeymortes/KropLive")
+                            )
+                            runCatching { context.startActivity(link) }
+                        },
+                        shape = RoundedCornerShape(14.dp),
+                        color = MaterialTheme.colorScheme.surfaceContainerHigh,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(14.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
+                            Icon(Icons.Default.Person, contentDescription = null)
+                            Text(
+                                "sergeymortes",
+                                modifier = Modifier.weight(1f),
+                                fontWeight = FontWeight.SemiBold
+                            )
+                            Icon(Icons.Default.OpenInNew, contentDescription = "Відкрити GitHub")
+                        }
+                    }
+                    Text(
+                        "Дата оновлення — дата встановлення або оновлення застосунку на цьому пристрої.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { showAboutDialog = false }) {
+                    Text("Закрити")
+                }
+            }
+        )
+    }
+
     if (infoDialog != null) {
         AlertDialog(
             onDismissRequest = {
                 infoDialog = null
             },
             title = {
-                Text("КропLive")
+                Text("Кроп Live")
             },
             text = {
                 Text(infoDialog.orEmpty())
@@ -422,6 +591,28 @@ fun SettingsScreen(
                     Text("Зрозуміло")
                 }
             }
+        )
+    }
+}
+
+@Composable
+private fun AboutInfoRow(label: String, value: String) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(
+            text = label,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.weight(1f)
+        )
+        Spacer(Modifier.width(12.dp))
+        Text(
+            text = value,
+            style = MaterialTheme.typography.bodyMedium,
+            fontWeight = FontWeight.SemiBold
         )
     }
 }
@@ -623,123 +814,7 @@ private fun NotificationSettingsScreen(onBack: () -> Unit) {
                 }
             }
 
-            HorizontalDivider()
 
-            Text(
-                text = "ПЕРЕВІРКА СПОВІЩЕНЬ",
-                style = MaterialTheme.typography.labelMedium,
-                fontWeight = FontWeight.SemiBold,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-
-            var testResult by remember { mutableStateOf<String?>(null) }
-
-            Text(
-                text = "Тестові повідомлення не змінюють реальний статус NEPTUN.",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-
-            listOf(
-                Triple("🟡 Тест жовтого рівня", "yellow", Icons.Default.WarningAmber),
-                Triple("🔴 Тест червоного рівня", "red", Icons.Default.NotificationsActive),
-                Triple("🟢 Тест зеленого рівня", "green", Icons.Default.CheckCircle)
-            ).forEach { (label, level, icon) ->
-                OutlinedButton(
-                    onClick = {
-                        testResult = sendAirNotificationTest(context, level)
-                    },
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Icon(icon, contentDescription = null)
-                    Spacer(Modifier.width(8.dp))
-                    Text(label)
-                }
-            }
-
-            testResult?.let { result ->
-                Text(
-                    text = result,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-            }
         }
-    }
-}
-
-/** Локальна перевірка системних сповіщень. Стан NEPTUN не змінюється. */
-private fun sendAirNotificationTest(context: Context, level: String): String {
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
-        context.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) !=
-        PackageManager.PERMISSION_GRANTED
-    ) {
-        return "Надайте дозвіл на сповіщення в налаштуваннях Android."
-    }
-    val notifications = NotificationManagerCompat.from(context)
-    if (!notifications.areNotificationsEnabled()) {
-        return "Системні сповіщення вимкнені. Увімкніть їх у налаштуваннях Android."
-    }
-
-    val isGreen = level == "green"
-    val channelId = if (isGreen) "air_test_green_heads_up_v2" else "air_test_${level}_v1"
-    val (title, body) = when (level) {
-        "red" -> "ТЕСТ · Червоний рівень NEPTUN" to
-                "Тестове попередження про високий рівень небезпеки. Це не реальна тривога."
-        "yellow" -> "ТЕСТ · Жовтий рівень NEPTUN" to
-                "Тестове повідомлення про повітряну загрозу. Це не реальна загроза."
-        else -> "ТЕСТ · Зелений рівень NEPTUN" to
-                "Тестове повідомлення: активних загроз не виявлено. Це не офіційний відбій."
-    }
-    val vibration = when (level) {
-        "red" -> longArrayOf(0L, 450L, 180L, 450L, 180L, 650L)
-        "yellow" -> longArrayOf(0L, 250L, 150L, 250L)
-        else -> longArrayOf(0L, 160L)
-    }
-    val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-    val channel = NotificationChannel(
-        channelId,
-        "Тест NEPTUN · " + when (level) {
-            "red" -> "червоний"
-            "yellow" -> "жовтий"
-            else -> "зелений"
-        },
-        NotificationManager.IMPORTANCE_HIGH
-    ).apply {
-        description = "Лише тестові повідомлення КропіLive"
-        enableVibration(true)
-        vibrationPattern = vibration
-    }
-    manager.createNotificationChannel(channel)
-
-    val openApp = context.packageManager.getLaunchIntentForPackage(context.packageName)
-    val pendingIntent = openApp?.let {
-        PendingIntent.getActivity(
-            context,
-            4100,
-            it.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP),
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
-    }
-    val notification = NotificationCompat.Builder(context, channelId)
-        .setSmallIcon(android.R.drawable.ic_dialog_alert)
-        .setContentTitle(title)
-        .setContentText(body)
-        .setStyle(NotificationCompat.BigTextStyle().bigText(body))
-        .setPriority(NotificationCompat.PRIORITY_HIGH)
-        .setCategory(NotificationCompat.CATEGORY_STATUS)
-        .setVibrate(vibration)
-        .setAutoCancel(true)
-        .apply { if (pendingIntent != null) setContentIntent(pendingIntent) }
-        .build()
-    return try {
-        @Suppress("MissingPermission")
-        notifications.notify(
-            when (level) { "red" -> 4101; "yellow" -> 4102; else -> 4103 },
-            notification
-        )
-        "Тест надіслано. Якщо немає спливного вікна, перевірте налаштування каналу в Android."
-    } catch (_: SecurityException) {
-        "Android заборонив показ сповіщення. Перевірте дозволи."
     }
 }
